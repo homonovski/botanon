@@ -2,14 +2,13 @@ import telebot
 import logging
 import json
 import os
-import time
 from collections import deque
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID'))
 DATA_FILE = "bot_data.json"
-ANTI_FLOOD_SECONDS = 1  # Секунд между сообщениями
+
 # ================================
 
 logging.basicConfig(
@@ -26,9 +25,7 @@ waiting_users = deque()
 active_chats = {}
 moderator_watching = {}
 blocked_users = set()
-last_message_time = {}
-
-
+reporting_users = {}
 # ========== ЗАГРУЗКА / СОХРАНЕНИЕ ==========
 def load_data():
     global blocked_users, waiting_users, active_chats, moderator_watching
@@ -60,16 +57,6 @@ def save_data():
         logging.error(f"Ошибка сохранения данных: {e}")
 
 
-# ========== АНТИ-ФЛУД ==========
-def is_flooding(user_id):
-    now = time.time()
-    last = last_message_time.get(user_id, 0)
-    if now - last < ANTI_FLOOD_SECONDS:
-        return True
-    last_message_time[user_id] = now
-    return False
-
-
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def stop_chat_for_user(user_id):
     if user_id in active_chats:
@@ -77,6 +64,8 @@ def stop_chat_for_user(user_id):
         del active_chats[user_id]
         if partner_id in active_chats:
             del active_chats[partner_id]
+        notify_admin_chat_stop(user_id, partner_id)
+    reporting_users.pop(user_id, None)
     if user_id in moderator_watching:
         del moderator_watching[user_id]
     save_data()
@@ -87,6 +76,41 @@ def send_safe(chat_id, text, **kwargs):
         bot.send_message(chat_id, text, **kwargs)
     except Exception as e:
         logging.error(f"Ошибка отправки сообщения {chat_id}: {e}")
+
+
+BUTTON_FIND = "🔍 Найти собеседника"
+BUTTON_NEXT = "⏭ Дальше"
+BUTTON_STOP = "🚪 Выйти"
+BUTTON_REPORT = "⚠ Пожаловаться"
+BUTTON_CANCEL = "❌ Отменить поиск"
+BUTTON_REPORT_CANCEL = "❌ Отменить жалобу"
+BUTTON_TEXTS = {BUTTON_FIND, BUTTON_NEXT, BUTTON_STOP, BUTTON_REPORT, BUTTON_CANCEL, BUTTON_REPORT_CANCEL}
+
+
+def user_reply_main():
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(telebot.types.KeyboardButton(BUTTON_FIND))
+    return markup
+
+
+def user_reply_chat():
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row(telebot.types.KeyboardButton(BUTTON_NEXT),
+               telebot.types.KeyboardButton(BUTTON_STOP))
+    markup.row(telebot.types.KeyboardButton(BUTTON_REPORT))
+    return markup
+
+
+def user_reply_queue():
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(telebot.types.KeyboardButton(BUTTON_CANCEL))
+    return markup
+
+
+def user_reply_reporting():
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(telebot.types.KeyboardButton(BUTTON_REPORT_CANCEL))
+    return markup
 
 
 # ========== КОМАНДЫ ДЛЯ ВСЕХ ==========
@@ -101,7 +125,8 @@ def start(message):
         "/find - найти собеседника\n"
         "/stop - завершить диалог\n"
         "/report - пожаловаться на собеседника\n"
-        "Просто отправляйте сообщения, и они будут доставлены анонимно.")
+        "Просто отправляйте сообщения, и они будут доставлены анонимно.",
+        reply_markup=user_reply_main())
 
 
 @bot.message_handler(commands=['find'])
@@ -117,18 +142,7 @@ def find_partner(message):
         bot.send_message(user_id, "Вы уже в поиске.")
         return
 
-    if waiting_users:
-        partner_id = waiting_users.popleft()
-        active_chats[user_id] = partner_id
-        active_chats[partner_id] = user_id
-        bot.send_message(user_id, "Собеседник найден! Для выхода /stop.")
-        bot.send_message(partner_id, "Собеседник найден! Для выхода /stop.")
-        save_data()
-        logging.info(f"Чат создан между {user_id} и {partner_id}")
-    else:
-        waiting_users.append(user_id)
-        save_data()
-        bot.send_message(user_id, "Ищем собеседника...")
+    find_partner_logic(user_id)
 
 
 @bot.message_handler(commands=['stop'])
@@ -137,18 +151,37 @@ def stop_chat(message):
     if user_id in waiting_users:
         waiting_users.remove(user_id)
         save_data()
-        bot.send_message(user_id, "Поиск отменён.")
+        bot.send_message(user_id, "Поиск отменён.", reply_markup=user_reply_main())
         return
 
     if user_id in active_chats:
         partner_id = active_chats[user_id]
         stop_chat_for_user(user_id)
-        bot.send_message(user_id, "Вы вышли из чата.")
-        send_safe(partner_id, "Собеседник покинул чат. Используйте /find.")
+        bot.send_message(user_id, "Вы вышли из чата.", reply_markup=user_reply_main())
+        send_safe(partner_id, "Собеседник покинул чат. Используйте /find.",
+                  reply_markup=user_reply_main())
         logging.info(f"Чат завершён между {user_id} и {partner_id}")
         return
 
     bot.send_message(user_id, "Вы не в чате. Используйте /find.")
+
+
+@bot.message_handler(commands=['next'])
+def next_partner(message):
+    user_id = message.chat.id
+    if user_id in blocked_users:
+        bot.send_message(user_id, "Вы заблокированы.")
+        return
+    if user_id in waiting_users:
+        bot.send_message(user_id, "Вы уже в поиске.")
+        return
+    if user_id in active_chats:
+        partner_id = active_chats[user_id]
+        stop_chat_for_user(user_id)
+        send_safe(partner_id, "Собеседник нажал /next. Используйте /find.",
+                  reply_markup=user_reply_main())
+
+    find_partner_logic(user_id)
 
 
 @bot.message_handler(commands=['report'])
@@ -158,8 +191,47 @@ def report_user(message):
         bot.send_message(user_id, "Вы не в чате.")
         return
     partner_id = active_chats[user_id]
-    send_safe(ADMIN_ID, f"Жалоба: пользователь {user_id} пожаловался на {partner_id}")
-    bot.send_message(user_id, "Жалоба отправлена администратору.")
+    reporting_users[user_id] = partner_id
+    bot.send_message(user_id, "Напишите причину жалобы:", reply_markup=user_reply_reporting())
+
+
+def notify_admin_chat_start(user_id, partner_id):
+    for watched_user, watched_partner in moderator_watching.items():
+        if user_id == watched_user:
+            bot.send_message(ADMIN_ID,
+                f"🔔 Пользователь {user_id} начал чат с {partner_id}")
+        elif partner_id == watched_user:
+            bot.send_message(ADMIN_ID,
+                f"🔔 Пользователь {partner_id} начал чат с {user_id}")
+
+
+def notify_admin_chat_stop(user_id, partner_id):
+    for watched_user in moderator_watching:
+        if user_id == watched_user:
+            bot.send_message(ADMIN_ID,
+                f"🔔 Пользователь {user_id} завершил чат с {partner_id}")
+        elif partner_id == watched_user:
+            bot.send_message(ADMIN_ID,
+                f"🔔 Пользователь {partner_id} завершил чат с {user_id}")
+
+
+def find_partner_logic(user_id):
+    if waiting_users:
+        partner_id = waiting_users.popleft()
+        active_chats[user_id] = partner_id
+        active_chats[partner_id] = user_id
+        bot.send_message(user_id, "Собеседник найден!",
+                         reply_markup=user_reply_chat())
+        bot.send_message(partner_id, "Собеседник найден!",
+                         reply_markup=user_reply_chat())
+        notify_admin_chat_start(user_id, partner_id)
+        save_data()
+        logging.info(f"Чат создан между {user_id} и {partner_id}")
+    else:
+        waiting_users.append(user_id)
+        save_data()
+        bot.send_message(user_id, "Ищем собеседника...",
+                         reply_markup=user_reply_queue())
 
 
 # ========== АДМИН-КЛАВИАТУРА ==========
@@ -218,6 +290,37 @@ def blocked_list_keyboard():
 
 
 # ========== АДМИН-КОМАНДЫ ==========
+@bot.message_handler(commands=['shutdown'])
+def shutdown(message):
+    if message.chat.id != ADMIN_ID:
+        return
+
+    bot.send_message(ADMIN_ID, "Оповещаю пользователей о технических работах...")
+
+    notified = set()
+    for user1, user2 in list(active_chats.items()):
+        if user1 not in notified:
+            send_safe(user1, "Бот уходит на технические работы. Чат завершён.")
+            notified.add(user1)
+        if user2 not in notified:
+            send_safe(user2, "Бот уходит на технические работы. Чат завершён.")
+            notified.add(user2)
+
+    queue_count = len(waiting_users)
+    for uid in list(waiting_users):
+        send_safe(uid, "Бот уходит на технические работы. Поиск отменён.")
+
+    waiting_users.clear()
+    active_chats.clear()
+    moderator_watching.clear()
+    reporting_users.clear()
+    save_data()
+
+    bot.send_message(ADMIN_ID,
+        f"Уведомлено {len(notified) + queue_count} пользователей. Бот остановлен.")
+    bot.stop_polling()
+
+
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
     if message.chat.id != ADMIN_ID:
@@ -344,12 +447,86 @@ def admin_callback(call):
     bot.answer_callback_query(call.id)
 
 
+# ========== ОБРАБОТКА КНОПОК РЕПЛАЙ-КЛАВИАТУРЫ ==========
+@bot.message_handler(func=lambda message: message.text in BUTTON_TEXTS)
+def handle_reply_button(message):
+    user_id = message.chat.id
+    text = message.text
+
+    if user_id in blocked_users:
+        bot.send_message(user_id, "Вы заблокированы.")
+        return
+
+    if text == BUTTON_FIND:
+        if user_id in active_chats:
+            bot.send_message(user_id, "Вы уже в чате.")
+            return
+        if user_id in waiting_users:
+            bot.send_message(user_id, "Вы уже в поиске.")
+            return
+        find_partner_logic(user_id)
+
+    elif text == BUTTON_NEXT:
+        if user_id not in active_chats:
+            bot.send_message(user_id, "Вы не в чате.")
+            return
+        partner_id = active_chats[user_id]
+        stop_chat_for_user(user_id)
+        send_safe(partner_id, "Собеседник нажал /next. Используйте /find.",
+                  reply_markup=user_reply_main())
+        bot.send_message(user_id, "Ищем следующего...",
+                         reply_markup=user_reply_main())
+        find_partner_logic(user_id)
+
+    elif text in (BUTTON_STOP, BUTTON_CANCEL):
+        if user_id in waiting_users:
+            waiting_users.remove(user_id)
+            save_data()
+            bot.send_message(user_id, "Поиск отменён.", reply_markup=user_reply_main())
+            return
+        if user_id in active_chats:
+            partner_id = active_chats[user_id]
+            stop_chat_for_user(user_id)
+            bot.send_message(user_id, "Вы вышли из чата.", reply_markup=user_reply_main())
+            send_safe(partner_id, "Собеседник покинул чат. Используйте /find.",
+                      reply_markup=user_reply_main())
+            logging.info(f"Чат завершён между {user_id} и {partner_id}")
+            return
+        bot.send_message(user_id, "Вы не в чате.")
+
+    elif text == BUTTON_REPORT:
+        if user_id not in active_chats:
+            bot.send_message(user_id, "Вы не в чате.")
+            return
+        partner_id = active_chats[user_id]
+        reporting_users[user_id] = partner_id
+        bot.send_message(user_id, "Напишите причину жалобы:", reply_markup=user_reply_reporting())
+
+    elif text == BUTTON_REPORT_CANCEL:
+        reporting_users.pop(user_id, None)
+        if user_id in active_chats:
+            bot.send_message(user_id, "Жалоба отменена.", reply_markup=user_reply_chat())
+        else:
+            bot.send_message(user_id, "Жалоба отменена.", reply_markup=user_reply_main())
+
+
 # ========== ПЕРЕСЫЛКА СООБЩЕНИЙ ==========
 @bot.message_handler(func=lambda message: True, content_types=[
     'text', 'photo', 'video', 'document', 'audio', 'voice', 'sticker', 'animation'
 ])
 def handle_message(message):
     user_id = message.chat.id
+
+    if user_id in reporting_users and message.content_type == 'text':
+        partner_id = reporting_users.pop(user_id)
+        send_safe(ADMIN_ID, f"Жалоба от {user_id} на {partner_id}:\n{message.text}")
+        if user_id in active_chats:
+            bot.send_message(user_id, "Жалоба отправлена администратору.",
+                             reply_markup=user_reply_chat())
+        else:
+            bot.send_message(user_id, "Жалоба отправлена администратору.",
+                             reply_markup=user_reply_main())
+        return
 
     if message.content_type == 'text' and message.text.startswith('/'):
         return
@@ -358,18 +535,28 @@ def handle_message(message):
         bot.send_message(user_id, "Вы заблокированы.")
         return
 
-    if is_flooding(user_id):
-        return
-
     if user_id in active_chats:
         partner_id = active_chats[user_id]
         try:
+            bot.send_chat_action(partner_id, "typing")
             bot.copy_message(partner_id, user_id, message.id)
 
             for watched_user, watched_partner in moderator_watching.items():
-                if user_id in (watched_user, watched_partner):
+                if user_id == watched_user:
+                    other_id = watched_partner
+                elif user_id == watched_partner:
+                    other_id = watched_user
+                else:
+                    continue
+
+                if message.content_type == 'text':
+                    bot.send_message(ADMIN_ID,
+                        f"[{user_id} -> {other_id}]: {message.text}")
+                else:
+                    bot.send_message(ADMIN_ID,
+                        f"📎 {message.content_type} от {user_id} для {other_id}")
                     bot.copy_message(ADMIN_ID, user_id, message.id)
-                    break
+                break
         except Exception as e:
             bot.send_message(user_id, f"Ошибка при отправке: {e}")
             logging.error(f"Ошибка пересылки от {user_id} к {partner_id}: {e}")
