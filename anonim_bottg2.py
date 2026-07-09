@@ -106,6 +106,13 @@ def user_reply_queue():
     return markup
 
 
+def report_reasons_keyboard(partner_id):
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    for i, reason in enumerate(REPORT_REASONS):
+        markup.add(telebot.types.InlineKeyboardButton(reason, callback_data=f"r_{partner_id}_{i}"))
+    return markup
+
+
 # ========== КОМАНДЫ ДЛЯ ВСЕХ ==========
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -184,8 +191,13 @@ def report_user(message):
         bot.send_message(user_id, "Вы не в чате.")
         return
     partner_id = active_chats[user_id]
-    bot.send_message(user_id, "Выберите причину жалобы:",
-                     reply_markup=report_reasons_keyboard(partner_id))
+    try:
+        bot.send_message(user_id, "Выберите причину жалобы:",
+                         reply_markup=report_reasons_keyboard(partner_id))
+        logging.info(f"report_user: причины жалобы отправлены {user_id}")
+    except Exception as e:
+        logging.error(f"report_user: ошибка отправки {user_id}: {e}")
+        bot.send_message(user_id, "Ошибка при создании жалобы.")
 
 
 def notify_admin_chat_start(user_id, partner_id):
@@ -376,11 +388,9 @@ def admin_callback(call):
             if user_id in moderator_watching:
                 del moderator_watching[user_id]
                 save_data()
-                bot.answer_callback_query(call.id, "Слежка отключена")
             else:
                 moderator_watching[user_id] = active_chats[user_id]
                 save_data()
-                bot.answer_callback_query(call.id, "Слежу за чатом")
         else:
             bot.answer_callback_query(call.id, "Чат не найден", show_alert=True)
             bot.edit_message_text("Админ-панель", ADMIN_ID, call.message.id,
@@ -403,7 +413,6 @@ def admin_callback(call):
         partner_id = active_chats[user_id]
         moderator_watching[user_id] = partner_id
         save_data()
-        bot.answer_callback_query(call.id, "Слежу за чатом")
         status = "Слежу" if user_id in moderator_watching else "Не слежу"
         bot.edit_message_text(
             f"Чат: {user_id} <-> {partner_id}\nСтатус: {status}",
@@ -422,13 +431,11 @@ def admin_callback(call):
         if user_id in waiting_users:
             waiting_users.remove(user_id)
         save_data()
-        bot.answer_callback_query(call.id, f"Пользователь {user_id} заблокирован")
         bot.edit_message_text("Админ-панель", ADMIN_ID, call.message.id,
                               reply_markup=admin_keyboard())
 
     elif data == "admin_stats":
         total = len({u for pair in active_chats.items() for u in pair}) + len(waiting_users)
-        bot.answer_callback_query(call.id, show_alert=True)
         bot.send_message(ADMIN_ID,
             f"Статистика:\n"
             f"Активных чатов: {len(active_chats) // 2}\n"
@@ -445,11 +452,11 @@ def admin_callback(call):
         if user_id in blocked_users:
             blocked_users.discard(user_id)
             save_data()
-            bot.answer_callback_query(call.id, f"Пользователь {user_id} разблокирован")
             bot.edit_message_text("Заблокированные пользователи:", ADMIN_ID, call.message.id,
                                   reply_markup=blocked_list_keyboard())
         else:
             bot.answer_callback_query(call.id, "Уже не заблокирован", show_alert=True)
+            return
 
     elif data == "admin_refresh":
         bot.edit_message_text(
@@ -471,11 +478,20 @@ def report_reason_callback(call):
     partner_id = int(parts[1])
     reason_idx = int(parts[2])
     reason = REPORT_REASONS[reason_idx]
+    logging.info(f"Выбрана причина жалобы: {reason} от {user_id} на {partner_id}")
 
-    bot.send_message(ADMIN_ID,
-        f"Жалоба от {user_id} на {partner_id}:\nПричина: {reason}",
-        reply_markup=report_admin_keyboard(user_id, partner_id))
-    bot.edit_message_text("Жалоба отправлена.", user_id, call.message.id)
+    try:
+        bot.send_message(ADMIN_ID,
+            f"Жалоба от {user_id} на {partner_id}:\nПричина: {reason}",
+            reply_markup=report_admin_keyboard(user_id, partner_id))
+    except Exception as e:
+        logging.error(f"Ошибка отправки жалобы админу: {e}")
+
+    try:
+        bot.edit_message_text("Жалоба отправлена.", user_id, call.message.id)
+    except Exception as e:
+        logging.error(f"Ошибка редактирования сообщения: {e}")
+
     bot.answer_callback_query(call.id, "Жалоба отправлена администратору.")
 
 
@@ -484,6 +500,7 @@ def report_reason_callback(call):
 def handle_reply_button(message):
     user_id = message.chat.id
     text = message.text
+    logging.info(f"Нажата reply-кнопка: {text} от {user_id}")
 
     if user_id in blocked_users:
         bot.send_message(user_id, "Вы заблокированы.")
@@ -500,7 +517,7 @@ def handle_reply_button(message):
 
     elif text == BUTTON_NEXT:
         if user_id not in active_chats:
-            bot.send_message(user_id, "Вы не в чате.")
+            bot.send_message(user_id, "Вы не в чате.", reply_markup=user_reply_main())
             return
         partner_id = active_chats[user_id]
         stop_chat_for_user(user_id)
@@ -524,15 +541,19 @@ def handle_reply_button(message):
                       reply_markup=user_reply_main())
             logging.info(f"Чат завершён между {user_id} и {partner_id}")
             return
-        bot.send_message(user_id, "Вы не в чате.")
+        bot.send_message(user_id, "Вы не в чате.", reply_markup=user_reply_main())
 
     elif text == BUTTON_REPORT:
         if user_id not in active_chats:
-            bot.send_message(user_id, "Вы не в чате.")
+            bot.send_message(user_id, "Вы не в чате.", reply_markup=user_reply_main())
             return
         partner_id = active_chats[user_id]
-        bot.send_message(user_id, "Выберите причину жалобы:",
-                         reply_markup=report_reasons_keyboard(partner_id))
+        try:
+            bot.send_message(user_id, "Выберите причину жалобы:",
+                             reply_markup=report_reasons_keyboard(partner_id))
+            logging.info(f"Пользователю {user_id} отправлены причины жалобы")
+        except Exception as e:
+            logging.error(f"Ошибка отправки причин жалобы {user_id}: {e}")
 
 
 # ========== ПЕРЕСЫЛКА СООБЩЕНИЙ ==========
