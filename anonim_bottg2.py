@@ -250,6 +250,11 @@ def admin_keyboard():
 
     markup.add(chats_btn, stats_btn)
     markup.add(blocked_btn, refresh_btn)
+
+    if moderator_watching:
+        markup.add(telebot.types.InlineKeyboardButton(
+            "❌ Отключить всю слежку", callback_data="admin_unwatch_all"))
+
     return markup
 
 
@@ -344,7 +349,8 @@ def admin_panel(message):
         f"Админ-панель\n\n"
         f"Активных чатов: {len(active_chats) // 2}\n"
         f"В очереди: {len(waiting_users)}\n"
-        f"Заблокировано: {len(blocked_users)}",
+        f"Заблокировано: {len(blocked_users)}\n"
+        f"Слежу за чатами: {len(moderator_watching)}",
         reply_markup=admin_keyboard())
 
 
@@ -357,7 +363,8 @@ def admin_callback(call):
             f"Админ-панель\n\n"
             f"Активных чатов: {len(active_chats) // 2}\n"
             f"В очереди: {len(waiting_users)}\n"
-            f"Заблокировано: {len(blocked_users)}",
+            f"Заблокировано: {len(blocked_users)}\n"
+            f"Слежу за чатами: {len(moderator_watching)}",
             ADMIN_ID, call.message.id,
             reply_markup=admin_keyboard())
 
@@ -458,12 +465,26 @@ def admin_callback(call):
             bot.answer_callback_query(call.id, "Уже не заблокирован", show_alert=True)
             return
 
+    elif data == "admin_unwatch_all":
+        count = len(moderator_watching)
+        moderator_watching.clear()
+        save_data()
+        bot.edit_message_text(
+            f"Админ-панель\n\n"
+            f"Активных чатов: {len(active_chats) // 2}\n"
+            f"В очереди: {len(waiting_users)}\n"
+            f"Заблокировано: {len(blocked_users)}\n\n"
+            f"Слежка отключена для {count} чатов.",
+            ADMIN_ID, call.message.id,
+            reply_markup=admin_keyboard())
+
     elif data == "admin_refresh":
         bot.edit_message_text(
             f"Админ-панель\n\n"
             f"Активных чатов: {len(active_chats) // 2}\n"
             f"В очереди: {len(waiting_users)}\n"
-            f"Заблокировано: {len(blocked_users)}",
+            f"Заблокировано: {len(blocked_users)}\n"
+            f"Слежу за чатами: {len(moderator_watching)}",
             ADMIN_ID, call.message.id,
             reply_markup=admin_keyboard())
 
