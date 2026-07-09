@@ -25,7 +25,6 @@ waiting_users = deque()
 active_chats = {}
 moderator_watching = {}
 blocked_users = set()
-reporting_users = {}
 # ========== ЗАГРУЗКА / СОХРАНЕНИЕ ==========
 def load_data():
     global blocked_users, waiting_users, active_chats, moderator_watching
@@ -65,7 +64,6 @@ def stop_chat_for_user(user_id):
         if partner_id in active_chats:
             del active_chats[partner_id]
         notify_admin_chat_stop(user_id, partner_id)
-    reporting_users.pop(user_id, None)
     if user_id in moderator_watching:
         del moderator_watching[user_id]
     save_data()
@@ -78,13 +76,14 @@ def send_safe(chat_id, text, **kwargs):
         logging.error(f"Ошибка отправки сообщения {chat_id}: {e}")
 
 
+REPORT_REASONS = ["Оскорбления", "Спам", "Неприличный контент", "Угрозы", "Выдача себя за другого", "Другое"]
+
 BUTTON_FIND = "🔍 Найти собеседника"
 BUTTON_NEXT = "⏭ Дальше"
 BUTTON_STOP = "🚪 Выйти"
 BUTTON_REPORT = "⚠ Пожаловаться"
 BUTTON_CANCEL = "❌ Отменить поиск"
-BUTTON_REPORT_CANCEL = "❌ Отменить жалобу"
-BUTTON_TEXTS = {BUTTON_FIND, BUTTON_NEXT, BUTTON_STOP, BUTTON_REPORT, BUTTON_CANCEL, BUTTON_REPORT_CANCEL}
+BUTTON_TEXTS = {BUTTON_FIND, BUTTON_NEXT, BUTTON_STOP, BUTTON_REPORT, BUTTON_CANCEL}
 
 
 def user_reply_main():
@@ -104,12 +103,6 @@ def user_reply_chat():
 def user_reply_queue():
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(telebot.types.KeyboardButton(BUTTON_CANCEL))
-    return markup
-
-
-def user_reply_reporting():
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(telebot.types.KeyboardButton(BUTTON_REPORT_CANCEL))
     return markup
 
 
@@ -191,8 +184,8 @@ def report_user(message):
         bot.send_message(user_id, "Вы не в чате.")
         return
     partner_id = active_chats[user_id]
-    reporting_users[user_id] = partner_id
-    bot.send_message(user_id, "Напишите причину жалобы:", reply_markup=user_reply_reporting())
+    bot.send_message(user_id, "Выберите причину жалобы:",
+                     reply_markup=report_reasons_keyboard(partner_id))
 
 
 def notify_admin_chat_start(user_id, partner_id):
@@ -277,6 +270,15 @@ def chat_actions_keyboard(user_id, partner_id):
     return markup
 
 
+def report_admin_keyboard(user_id, partner_id):
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        telebot.types.InlineKeyboardButton("🔍 Следить", callback_data=f"watch_report_{partner_id}"),
+        telebot.types.InlineKeyboardButton("⛔ Блок", callback_data=f"block_{partner_id}")
+    )
+    return markup
+
+
 def blocked_list_keyboard():
     markup = telebot.types.InlineKeyboardMarkup(row_width=1)
     for uid in list(blocked_users):
@@ -313,7 +315,6 @@ def shutdown(message):
     waiting_users.clear()
     active_chats.clear()
     moderator_watching.clear()
-    reporting_users.clear()
     save_data()
 
     bot.send_message(ADMIN_ID,
@@ -394,6 +395,21 @@ def admin_callback(call):
                 ADMIN_ID, call.message.id,
                 reply_markup=chat_actions_keyboard(user_id, partner_id))
 
+    elif data.startswith("watch_report_"):
+        user_id = int(data.split("_")[2])
+        if user_id not in active_chats:
+            bot.answer_callback_query(call.id, "Пользователь уже не в чате", show_alert=True)
+            return
+        partner_id = active_chats[user_id]
+        moderator_watching[user_id] = partner_id
+        save_data()
+        bot.answer_callback_query(call.id, "Слежу за чатом")
+        status = "Слежу" if user_id in moderator_watching else "Не слежу"
+        bot.edit_message_text(
+            f"Чат: {user_id} <-> {partner_id}\nСтатус: {status}",
+            ADMIN_ID, call.message.id,
+            reply_markup=chat_actions_keyboard(user_id, partner_id))
+
     elif data.startswith("block_"):
         user_id = int(data.split("_")[1])
         if user_id not in active_chats:
@@ -445,6 +461,22 @@ def admin_callback(call):
             reply_markup=admin_keyboard())
 
     bot.answer_callback_query(call.id)
+
+
+# ========== ВЫБОР ПРИЧИНЫ ЖАЛОБЫ ==========
+@bot.callback_query_handler(func=lambda call: call.data.startswith("r_") and call.message.chat.id != ADMIN_ID)
+def report_reason_callback(call):
+    user_id = call.message.chat.id
+    parts = call.data.split("_")
+    partner_id = int(parts[1])
+    reason_idx = int(parts[2])
+    reason = REPORT_REASONS[reason_idx]
+
+    bot.send_message(ADMIN_ID,
+        f"Жалоба от {user_id} на {partner_id}:\nПричина: {reason}",
+        reply_markup=report_admin_keyboard(user_id, partner_id))
+    bot.edit_message_text("Жалоба отправлена.", user_id, call.message.id)
+    bot.answer_callback_query(call.id, "Жалоба отправлена администратору.")
 
 
 # ========== ОБРАБОТКА КНОПОК РЕПЛАЙ-КЛАВИАТУРЫ ==========
@@ -499,15 +531,8 @@ def handle_reply_button(message):
             bot.send_message(user_id, "Вы не в чате.")
             return
         partner_id = active_chats[user_id]
-        reporting_users[user_id] = partner_id
-        bot.send_message(user_id, "Напишите причину жалобы:", reply_markup=user_reply_reporting())
-
-    elif text == BUTTON_REPORT_CANCEL:
-        reporting_users.pop(user_id, None)
-        if user_id in active_chats:
-            bot.send_message(user_id, "Жалоба отменена.", reply_markup=user_reply_chat())
-        else:
-            bot.send_message(user_id, "Жалоба отменена.", reply_markup=user_reply_main())
+        bot.send_message(user_id, "Выберите причину жалобы:",
+                         reply_markup=report_reasons_keyboard(partner_id))
 
 
 # ========== ПЕРЕСЫЛКА СООБЩЕНИЙ ==========
@@ -516,17 +541,6 @@ def handle_reply_button(message):
 ])
 def handle_message(message):
     user_id = message.chat.id
-
-    if user_id in reporting_users and message.content_type == 'text':
-        partner_id = reporting_users.pop(user_id)
-        send_safe(ADMIN_ID, f"Жалоба от {user_id} на {partner_id}:\n{message.text}")
-        if user_id in active_chats:
-            bot.send_message(user_id, "Жалоба отправлена администратору.",
-                             reply_markup=user_reply_chat())
-        else:
-            bot.send_message(user_id, "Жалоба отправлена администратору.",
-                             reply_markup=user_reply_main())
-        return
 
     if message.content_type == 'text' and message.text.startswith('/'):
         return
