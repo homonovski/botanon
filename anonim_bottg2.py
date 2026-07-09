@@ -162,6 +162,61 @@ def report_user(message):
     bot.send_message(user_id, "Жалоба отправлена администратору.")
 
 
+# ========== АДМИН-КЛАВИАТУРА ==========
+def admin_keyboard():
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+
+    chats_btn = telebot.types.InlineKeyboardButton("Чаты", callback_data="admin_chats")
+    stats_btn = telebot.types.InlineKeyboardButton("Статистика", callback_data="admin_stats")
+    blocked_btn = telebot.types.InlineKeyboardButton("Заблокированные", callback_data="admin_blocked")
+    refresh_btn = telebot.types.InlineKeyboardButton("Обновить", callback_data="admin_refresh")
+
+    markup.add(chats_btn, stats_btn)
+    markup.add(blocked_btn, refresh_btn)
+    return markup
+
+
+def chat_list_keyboard():
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    seen = set()
+    for user1, user2 in list(active_chats.items()):
+        if user1 not in seen and user2 not in seen:
+            seen.add(user1)
+            seen.add(user2)
+            btn = telebot.types.InlineKeyboardButton(
+                f"Чат {user1} <-> {user2}",
+                callback_data=f"chat_{user1}"
+            )
+            markup.add(btn)
+    markup.add(telebot.types.InlineKeyboardButton("Назад", callback_data="admin_menu"))
+    return markup
+
+
+def chat_actions_keyboard(user_id, partner_id):
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    watching = "Слежу" if user_id in moderator_watching else "Следить"
+    markup.add(
+        telebot.types.InlineKeyboardButton(f"{watching}", callback_data=f"toggle_watch_{user_id}"),
+        telebot.types.InlineKeyboardButton("Заблокировать", callback_data=f"block_{user_id}")
+    )
+    markup.add(
+        telebot.types.InlineKeyboardButton("Назад к чатам", callback_data="admin_chats")
+    )
+    return markup
+
+
+def blocked_list_keyboard():
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    for uid in list(blocked_users):
+        markup.add(telebot.types.InlineKeyboardButton(
+            f"Разблокировать {uid}", callback_data=f"unblock_{uid}"
+        ))
+    if not blocked_users:
+        markup.add(telebot.types.InlineKeyboardButton("Нет заблокированных", callback_data="none"))
+    markup.add(telebot.types.InlineKeyboardButton("Назад", callback_data="admin_menu"))
+    return markup
+
+
 # ========== АДМИН-КОМАНДЫ ==========
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
@@ -169,118 +224,124 @@ def admin_panel(message):
         bot.send_message(message.chat.id, "Нет прав.")
         return
 
-    text = "Активные чаты:\n"
-    if not active_chats:
-        text += "Нет активных чатов.\n"
-    else:
-        seen = set()
-        for user1, user2 in active_chats.items():
-            if user1 not in seen and user2 not in seen:
-                seen.add(user1)
-                seen.add(user2)
-                text += f"Чат: {user1} <-> {user2}\n"
-
-    text += f"\nОжидают в очереди: {len(waiting_users)}"
-    text += f"\nЗаблокировано: {len(blocked_users)}"
-    text += "\n\n/watch <id> - следить за чатом"
-    text += "\n/unwatch <id> - не следить"
-    text += "\n/block <id> [причина] - заблокировать"
-    text += "\n/unblock <id> - разблокировать"
-    text += "\n/stats - статистика"
-
-    bot.send_message(ADMIN_ID, text)
-
-
-@bot.message_handler(commands=['watch'])
-def watch_chat(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    try:
-        user_id = int(message.text.split()[1])
-    except Exception:
-        bot.send_message(ADMIN_ID, "Использование: /watch <user_id>")
-        return
-
-    if user_id not in active_chats:
-        bot.send_message(ADMIN_ID, f"Пользователь {user_id} не в чате.")
-        return
-
-    partner_id = active_chats[user_id]
-    moderator_watching[user_id] = partner_id
-    save_data()
-    bot.send_message(ADMIN_ID, f"Слежу за чатом {user_id} <-> {partner_id}")
-
-
-@bot.message_handler(commands=['unwatch'])
-def unwatch_chat(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    try:
-        user_id = int(message.text.split()[1])
-    except Exception:
-        bot.send_message(ADMIN_ID, "Использование: /unwatch <user_id>")
-        return
-
-    if user_id in moderator_watching:
-        del moderator_watching[user_id]
-        save_data()
-        bot.send_message(ADMIN_ID, f"Больше не слежу за {user_id}.")
-    else:
-        bot.send_message(ADMIN_ID, f"Вы не следили за {user_id}.")
-
-
-@bot.message_handler(commands=['block'])
-def block_user(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    try:
-        args = message.text.split(maxsplit=2)
-        user_id = int(args[1])
-        reason = args[2] if len(args) > 2 else "Без причины"
-    except Exception:
-        bot.send_message(ADMIN_ID, "Использование: /block <user_id> [причина]")
-        return
-
-    blocked_users.add(user_id)
-    if user_id in active_chats:
-        partner_id = active_chats[user_id]
-        send_safe(partner_id, "Собеседник заблокирован администратором. Нажмите /find.")
-        stop_chat_for_user(user_id)
-    if user_id in waiting_users:
-        waiting_users.remove(user_id)
-    save_data()
-    bot.send_message(ADMIN_ID, f"Пользователь {user_id} заблокирован. Причина: {reason}")
-
-
-@bot.message_handler(commands=['unblock'])
-def unblock_user(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    try:
-        user_id = int(message.text.split()[1])
-    except Exception:
-        bot.send_message(ADMIN_ID, "Использование: /unblock <user_id>")
-        return
-
-    if user_id in blocked_users:
-        blocked_users.discard(user_id)
-        save_data()
-        bot.send_message(ADMIN_ID, f"Пользователь {user_id} разблокирован.")
-    else:
-        bot.send_message(ADMIN_ID, f"Пользователь {user_id} не был заблокирован.")
-
-
-@bot.message_handler(commands=['stats'])
-def stats(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    total_users = len({u for pair in active_chats.items() for u in pair}) + len(waiting_users)
     bot.send_message(ADMIN_ID,
-        f"Статистика:\n"
+        f"Админ-панель\n\n"
         f"Активных чатов: {len(active_chats) // 2}\n"
         f"В очереди: {len(waiting_users)}\n"
-        f"Заблокировано: {len(blocked_users)}\n"
-        f"Уникальных пользователей сейчас: {total_users}")
+        f"Заблокировано: {len(blocked_users)}",
+        reply_markup=admin_keyboard())
+
+
+@bot.callback_query_handler(func=lambda call: call.message.chat.id == ADMIN_ID)
+def admin_callback(call):
+    data = call.data
+
+    if data == "admin_menu":
+        bot.edit_message_text(
+            f"Админ-панель\n\n"
+            f"Активных чатов: {len(active_chats) // 2}\n"
+            f"В очереди: {len(waiting_users)}\n"
+            f"Заблокировано: {len(blocked_users)}",
+            ADMIN_ID, call.message.id,
+            reply_markup=admin_keyboard())
+
+    elif data == "admin_chats":
+        if not active_chats:
+            bot.answer_callback_query(call.id, "Нет активных чатов", show_alert=True)
+            return
+        bot.edit_message_text("Выберите чат:", ADMIN_ID, call.message.id,
+                              reply_markup=chat_list_keyboard())
+
+    elif data.startswith("chat_"):
+        user_id = int(data.split("_")[1])
+        if user_id not in active_chats:
+            bot.answer_callback_query(call.id, "Чат уже завершён", show_alert=True)
+            bot.edit_message_text("Админ-панель", ADMIN_ID, call.message.id,
+                                  reply_markup=admin_keyboard())
+            return
+        partner_id = active_chats[user_id]
+        status = "Слежу" if user_id in moderator_watching else "Не слежу"
+        bot.edit_message_text(
+            f"Чат: {user_id} <-> {partner_id}\nСтатус: {status}",
+            ADMIN_ID, call.message.id,
+            reply_markup=chat_actions_keyboard(user_id, partner_id))
+
+    elif data.startswith("toggle_watch_"):
+        user_id = int(data.split("_")[2])
+        if user_id in active_chats:
+            if user_id in moderator_watching:
+                del moderator_watching[user_id]
+                save_data()
+                bot.answer_callback_query(call.id, "Слежка отключена")
+            else:
+                moderator_watching[user_id] = active_chats[user_id]
+                save_data()
+                bot.answer_callback_query(call.id, "Слежу за чатом")
+        else:
+            bot.answer_callback_query(call.id, "Чат не найден", show_alert=True)
+            bot.edit_message_text("Админ-панель", ADMIN_ID, call.message.id,
+                                  reply_markup=admin_keyboard())
+            return
+        # Обновляем сообщение
+        if user_id in active_chats:
+            partner_id = active_chats[user_id]
+            status = "Слежу" if user_id in moderator_watching else "Не слежу"
+            bot.edit_message_text(
+                f"Чат: {user_id} <-> {partner_id}\nСтатус: {status}",
+                ADMIN_ID, call.message.id,
+                reply_markup=chat_actions_keyboard(user_id, partner_id))
+
+    elif data.startswith("block_"):
+        user_id = int(data.split("_")[1])
+        if user_id not in active_chats:
+            bot.answer_callback_query(call.id, "Пользователь уже не в чате", show_alert=True)
+            return
+        partner_id = active_chats[user_id]
+        blocked_users.add(user_id)
+        send_safe(partner_id, "Собеседник заблокирован администратором. Нажмите /find.")
+        stop_chat_for_user(user_id)
+        if user_id in waiting_users:
+            waiting_users.remove(user_id)
+        save_data()
+        bot.answer_callback_query(call.id, f"Пользователь {user_id} заблокирован")
+        bot.edit_message_text("Админ-панель", ADMIN_ID, call.message.id,
+                              reply_markup=admin_keyboard())
+
+    elif data == "admin_stats":
+        total = len({u for pair in active_chats.items() for u in pair}) + len(waiting_users)
+        bot.answer_callback_query(call.id, show_alert=True)
+        bot.send_message(ADMIN_ID,
+            f"Статистика:\n"
+            f"Активных чатов: {len(active_chats) // 2}\n"
+            f"В очереди: {len(waiting_users)}\n"
+            f"Заблокировано: {len(blocked_users)}\n"
+            f"Уникальных пользователей сейчас: {total}")
+
+    elif data == "admin_blocked":
+        bot.edit_message_text("Заблокированные пользователи:", ADMIN_ID, call.message.id,
+                              reply_markup=blocked_list_keyboard())
+
+    elif data.startswith("unblock_"):
+        user_id = int(data.split("_")[1])
+        if user_id in blocked_users:
+            blocked_users.discard(user_id)
+            save_data()
+            bot.answer_callback_query(call.id, f"Пользователь {user_id} разблокирован")
+            bot.edit_message_text("Заблокированные пользователи:", ADMIN_ID, call.message.id,
+                                  reply_markup=blocked_list_keyboard())
+        else:
+            bot.answer_callback_query(call.id, "Уже не заблокирован", show_alert=True)
+
+    elif data == "admin_refresh":
+        bot.edit_message_text(
+            f"Админ-панель\n\n"
+            f"Активных чатов: {len(active_chats) // 2}\n"
+            f"В очереди: {len(waiting_users)}\n"
+            f"Заблокировано: {len(blocked_users)}",
+            ADMIN_ID, call.message.id,
+            reply_markup=admin_keyboard())
+
+    bot.answer_callback_query(call.id)
 
 
 # ========== ПЕРЕСЫЛКА СООБЩЕНИЙ ==========
